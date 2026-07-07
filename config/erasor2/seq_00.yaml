@@ -1,61 +1,60 @@
-start_frame: 4390
-end_frame: 4530
+start_frame: 0
+end_frame: 1000
 viz_interval: 10
-is_large_scale: true
+is_large_scale: false
 
 dataloader:
     run_traj_clustering: false
     dataset_name: "SemanticKITTI"
-    abs_data_dir: "/home/url/datasets/kitti/dataset/sequences"
+    abs_data_dir: "/home/tony/ros/origin_nav2025_developing/erasor2_dataset/dataset/sequences"
     cloud_dir: ""
     cloud_format: ""
     pose_path: ""
     sequence: "00"
-    abs_save_dir: "/home/url/datasets/erasor2_outputs/SemanticKITTI"
+    abs_save_dir: "/home/tony/erasor2_output"
     instance_seg_method: "hdbscan"
 
-    accum_interval: 1
-    voxel_size: 0.2
-    map_voxel_size: 0.2
+    accum_interval: 2
+    voxel_size: 0.05
+    map_voxel_size: 0.05
 
-    expansion_range: 0 # It is only needed for HeLiPR
+    expansion_range: 0
 
 erasor2:
-    grid_resolution: 1.0
-    egocentric_grid_resolution: 0.6
-    range_of_interest: 80.0
-    # min_z_voi 와 max_z_voi 는 raw cloud 기준 (ERASOR 1.0과 다름!!!)
-    min_z_voi: -4.5
-    max_z_voi: 1.5
-    min_z_diff_thr: 0.4 # 물체가 존재한다고 가정 할 수있는 최소한의 z 차이
-    scan_ratio_threshold: 0.2 # The Larger, the more aggressive!!
+    grid_resolution: 0.5
+    egocentric_grid_resolution: 0.3
+    range_of_interest: 40.0
+
+    min_z_voi: -1.5
+    max_z_voi: 2.3
+    min_z_diff_thr: 0.3
+    scan_ratio_threshold: 0.2
+
     log_odds:
-        increment_gain: 2.0 # Should be larger than one
+        increment_gain: 2.0
         increment: 0.15
+
     region_proposal_thr: 0.8
     kernel_size: 1
 
-    # For checking ground likelihood
-    ratio_num_pts: 0.95 # Percentage
+    ratio_num_pts: 0.95
     minimum_num_pts: 5
 
-    # For detection moving objects
     moving_object_detection:
         negative_log_odds: -2.0
-        obj_score_soft_thr: 4.6   # 75% - 1.098, 80% - 1.386, 90% - 2.197, 95.3 % - 3.0
-        obj_score_hard_thr: 14.0  # 99.99 % - 10.0, 99.9999 % - 14.0
+        obj_score_soft_thr: 4.6
+        obj_score_hard_thr: 14.0
         hard_thr_radius: 10.0
 
-    # To manage over-segmented parts
     over_segmentation:
-        minimum_area_thr: 56 # [m^2]
+        minimum_area_thr: 8
         ratio_of_unknown_prior: 0.25
 
     volumetric_outlier_removal:
         window_size: 1
         use_adaptive_voxel_size: true
-        vor_cand_score_thr: 4.6 # Larger than `obj_score_soft_thr` and smaller than `obj_score_hard_thr`
-        dist_thr_gain: 1.732 # The larger, the more aggressive
+        vor_cand_score_thr: 4.6
+        dist_thr_gain: 1.732
 
     viz_flag:
         set_scan_and_pose: true
@@ -69,8 +68,8 @@ erasor2:
 stop_for_each_frame: false
 
 extrinsic:
-    robot_body_size: 2.7
-    sensor_height: 1.73
+    robot_body_size: 0.6
+    sensor_height: 0.0
     rotation: [ 1, 0, 0,
                 0, 1, 0,
                 0, 0, 1 ]

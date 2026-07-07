@@ -57,6 +57,9 @@ inline vector<float> splitLine(const string &input, char delimiter) {
   string temp;
 
   while (getline(ss, temp, delimiter)) {
+    if (temp.empty() || temp == "\r") {
+      continue;
+    }
     answer.push_back(stof(temp));
   }
   return answer;
@@ -71,48 +74,37 @@ inline void vec2tf4x4(vector<float> &pose, Eigen::Matrix4f &tf4x4) {
 }
 
 void loadAllPoses(string pose_path, vector<Eigen::Matrix4f> &poses) {
-  // Pose is transformed into lidar pose!
-  // https://github.com/ZuoJiaxing/Kitti_Lidarmap_fromGt/blob/master/constructLaserMap.cpp
-
-  Eigen::Matrix4f KITTI_CAM2LIDAR = Eigen::Matrix4f::Identity();
-  Eigen::Matrix4f tf_origin       = Eigen::Matrix4f::Identity();
-
-  KITTI_CAM2LIDAR << -1.857739385241e-03, -9.999659513510e-01, -8.039975204516e-03,
-      -4.784029760483e-03, -6.481465826011e-03, 8.051860151134e-03, -9.999466081774e-01,
-      -7.337429464231e-02, 9.999773098287e-01, -1.805528627661e-03, -6.496203536139e-03,
-      -3.339968064433e-01, 0, 0, 0, 1;
-
-  tf_origin << 0, 0, 1, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 1;
-  // Tr?
-  //    KITTI_CAM2LIDAR << 4.276802385584e-04, -9.999672484946e-01, -8.084491683471e-03,
-  //    -1.198459927713e-02,
-  //                       -7.210626507497e-03, 8.081198471645e-03, -9.999413164504e-01,
-  //                       -5.403984729748e-02, 9.999738645903e-01, 4.859485810390e-04,
-  //                       -7.206933692422e-03, -2.921968648686e-01, 0, 0, 0, 1;
-
-  //    KITTI_CAM2LIDAR << 7.755449000000e-03, -9.999694000000e-01, -1.014303000000e-03,
-  //    -7.275538000000e-03,
-  //                       2.294056000000e-03, 1.032122000000e-03, -9.999968000000e-01,
-  //                       -6.324057000000e-02,
-  //                       9.999673000000e-01, 7.753097000000e-03, 2.301990000000e-03,
-  //                       -2.670414000000e-01, 0, 0, 0, 1;
+  // Custom/Adaptive-LIO export mode: poses are already T_map_lidar in KITTI
+  // row-major 3x4 format. Do not apply SemanticKITTI/SuMa camera-to-lidar
+  // conversion here, otherwise accumulated clouds are rotated/misaligned.
   poses.clear();
-  poses.reserve(2000);
-  std::ifstream in(pose_path);
-  string line;
+  poses.reserve(20000);
 
+  std::ifstream in(pose_path);
+  if (!in.is_open()) {
+    throw invalid_argument("Fail to open pose file: " + pose_path);
+  }
+
+  string line;
   int count = 0;
   while (std::getline(in, line)) {
-    vector<float> pose        = splitLine(line, ' ');
-    Eigen::Matrix4f tf4x4_cam = Eigen::Matrix4f::Identity();  // Crucial!
-    vec2tf4x4(pose, tf4x4_cam);
-    Eigen::Matrix4f tf4x4_lidar = tf_origin * tf4x4_cam * KITTI_CAM2LIDAR;
-    //        Eigen::Matrix4f tf4x4_lidar = KITTI_CAM2LIDAR.inverse() * tf4x4_cam * KITTI_CAM2LIDAR;
+    if (line.empty()) {
+      continue;
+    }
+    vector<float> pose = splitLine(line, ' ');
+    if (pose.size() != 12) {
+      throw invalid_argument("Invalid pose format in " + pose_path + ": expected 12 KITTI values");
+    }
+
+    Eigen::Matrix4f tf4x4_lidar = Eigen::Matrix4f::Identity();
+    vec2tf4x4(pose, tf4x4_lidar);
     poses.emplace_back(tf4x4_lidar);
     count++;
   }
   in.close();
-  std::cout << "Total " << count << " poses are loaded" << std::endl;
+
+  std::cout << "Total " << count
+            << " poses are loaded as direct T_map_lidar poses" << std::endl;
 
   if (count == 0) {
     throw invalid_argument("Fail to load poses. Please check the `pose_path_`");
