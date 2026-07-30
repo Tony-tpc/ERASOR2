@@ -13,9 +13,11 @@
 // Designed as free functions over a single global stream so we don't have to
 // thread a logger pointer through every method that used to publish.
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>

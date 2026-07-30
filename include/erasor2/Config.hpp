@@ -5,6 +5,7 @@
 // reads. Field names mirror the original 1:1 so call sites only have to swap
 // `params->foo_` for `config.foo_`.
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,11 @@ struct Config {
   bool correct_poses_by_submap_matching  = false;
   bool correct_poses                     = false;
   bool save_map                          = false;
+
+  // External-memory multi-pass execution.
+  bool streaming_enabled                  = true;
+  std::size_t streaming_compact_threshold = 5000000;
+  bool streaming_use_gt_labels            = false;
 
   // Dataset paths
   std::string dataset_name;
