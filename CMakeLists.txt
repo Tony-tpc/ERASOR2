@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(erasor2 VERSION 1.1.0 LANGUAGES CXX)
+project(erasor2 VERSION 1.1.0 LANGUAGES C CXX)
 
 # Pure-C++ build. Replaces the v1.0 catkin layer; nothing here depends on
 # a ROS environment. The only dependency that used to ship as a catkin
@@ -15,25 +15,42 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Eigen3 REQUIRED)
+
+# Debian/Ubuntu PCL is linked against VTK. Some VTK builds export VTK::mpi
+# with MPI::MPI_C in their link interface. Because this project originally
+# enabled only CXX, FindMPI could not create MPI::MPI_C and CMake generation
+# failed. Enable C above and discover the C MPI target before loading PCL/VTK.
+find_package(MPI REQUIRED COMPONENTS C)
+
 find_package(PCL 1.7 REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system filesystem)
 find_package(OpenCV REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
-# rerun_sdk replaces every visualization publisher. Pulled at configure
-# time as a prebuilt zip; no system install needed.
-include(FetchContent)
-FetchContent_Declare(
-    rerun_sdk
-    URL https://github.com/rerun-io/rerun/releases/download/0.32.1/rerun_cpp_sdk.zip
-)
-FetchContent_MakeAvailable(rerun_sdk)
+# Rerun is optional. It is disabled by default so headless/offline builds do
+# not download rerun_cpp_sdk (and its Apache Arrow dependency) during CMake
+# configuration. Enable explicitly with -DERASOR2_ENABLE_RERUN=ON.
+option(ERASOR2_ENABLE_RERUN "Build Rerun visualization support" OFF)
+
+if(ERASOR2_ENABLE_RERUN)
+    include(FetchContent)
+    FetchContent_Declare(
+        rerun_sdk
+        URL https://github.com/rerun-io/rerun/releases/download/0.32.1/rerun_cpp_sdk.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(rerun_sdk)
+    set(ERASOR2_RERUN_SOURCE src/erasor2/RerunLogger.cpp)
+else()
+    message(STATUS "ERASOR2: Rerun visualization disabled (offline/headless build)")
+    set(ERASOR2_RERUN_SOURCE src/erasor2/RerunLoggerStub.cpp)
+endif()
 
 # --- Shared static lib used by all erasor2 binaries -------------------------
 add_library(erasor2_core STATIC
     src/erasor2/Config.cpp
-    src/erasor2/RerunLogger.cpp
+    ${ERASOR2_RERUN_SOURCE}
     src/erasor2/grid_map.cpp
 )
 target_include_directories(erasor2_core PUBLIC
@@ -47,11 +64,16 @@ target_include_directories(erasor2_core SYSTEM PUBLIC
 )
 target_link_libraries(erasor2_core PUBLIC
     yaml-cpp
-    rerun_sdk
     ${PCL_LIBRARIES}
     ${OpenCV_LIBRARIES}
     ${Boost_LIBRARIES}
 )
+if(ERASOR2_ENABLE_RERUN)
+    target_link_libraries(erasor2_core PUBLIC rerun_sdk)
+    target_compile_definitions(erasor2_core PUBLIC ERASOR2_ENABLE_RERUN=1)
+else()
+    target_compile_definitions(erasor2_core PUBLIC ERASOR2_ENABLE_RERUN=0)
+endif()
 
 set(erasor2_src
     src/erasor2/erasor_utils.cpp

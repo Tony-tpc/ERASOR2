@@ -191,6 +191,49 @@ class ERASOR2 : public RosParamServer {
 
   void saveStaticMap(const string &static_map_path);
 
+  // ------------------------------------------------------------------
+  // External-memory, three-pass interface
+  // ------------------------------------------------------------------
+  // Pass 1 builds and periodically compacts the global labelled voxel map.
+  void streamingBegin();
+  void streamingAccumulateFrame(const Eigen::Matrix4f &pose_raw,
+                                const pcl::PointCloud<pcl::PointXYZI> &cloud_est_label,
+                                std::size_t compact_threshold_points);
+  void streamingFinalizeSubmap();
+
+  // Pass 2 updates the global steppable-region probability grid one frame
+  // at a time. No per-frame point cloud is retained after this returns.
+  void streamingUpdateFrame(std::size_t global_local_index,
+                            const pcl::PointCloud<pcl::PointXYZI> &cloud_est_label);
+  void streamingFinalizeGrid();
+  void streamingReleaseGlobalMap();
+
+  // Pass 3 loads only a bounded temporal window, runs the original object
+  // detection + VOR logic, and returns the center-frame result.
+  void streamingProcessWindow(
+      const std::vector<Eigen::Matrix4f> &poses_raw,
+      const std::vector<pcl::PointCloud<pcl::PointXYZI>> &clouds_est_label,
+      std::size_t center_index,
+      pcl::PointCloud<pcl::PointXYZI> &source_transformed,
+      pcl::PointCloud<pcl::PointXYZI> &static_transformed,
+      pcl::PointCloud<pcl::PointXYZI> &dynamic_transformed,
+      pcl::PointCloud<pcl::PointXYZI> &potential_dynamic_transformed);
+
+  void streamingAppendStaticResult(
+      const pcl::PointCloud<pcl::PointXYZI> &static_transformed,
+      std::size_t compact_threshold_points);
+  void streamingSaveStaticMap(const string &static_map_path);
+
+  const std::vector<Eigen::Matrix4f> &streamingPoses() const { return stream_poses_all_; }
+
+  // Streaming metadata only (small, O(number of frames)).
+  std::vector<Eigen::Matrix4f> stream_poses_all_;
+  std::vector<erasor2::Index> stream_idxes_all_;
+  float stream_min_x_ = std::numeric_limits<float>::max();
+  float stream_min_y_ = std::numeric_limits<float>::max();
+  float stream_max_x_ = std::numeric_limits<float>::lowest();
+  float stream_max_y_ = std::numeric_limits<float>::lowest();
+
   void publishStaticMapResults();
 
   void maskNonVoI(const pcl::PointCloud<pcl::PointXYZI> &src,

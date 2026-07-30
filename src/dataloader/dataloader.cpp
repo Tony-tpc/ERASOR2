@@ -128,14 +128,9 @@ void SemanticKITTILoader::getScanAndPose(size_t i,
                                          Eigen::Matrix4f &pose) {
   loadCloud(i, cloud);
 
-  shared_ptr<vector<uint32_t>> label(new vector<uint32_t>);
-  loadGTLabel(i, *label);
-
-  if (cloud.points.size() != label->size()) {
-    throw invalid_argument(
-        "Something's wrong! The numbers of points are not matched to each other");
-  }
-
+  // Estimated-label processing does not require SemanticKITTI ground-truth
+  // labels. This avoids one full label-file read per pass and lets custom
+  // datasets omit the dummy labels/ directory entirely.
   shared_ptr<vector<uint32_t>> ground_label(new vector<uint32_t>);
   shared_ptr<vector<uint32_t>> instance_label(new vector<uint32_t>);
   uint32_t max_instance;

@@ -1,12 +1,12 @@
 start_frame: 0
-end_frame: 1000
+end_frame: 2700
 viz_interval: 10
 is_large_scale: false
 
 dataloader:
     run_traj_clustering: false
     dataset_name: "SemanticKITTI"
-    abs_data_dir: "/home/tony/ros/origin_nav2025_developing/erasor2_dataset/dataset/sequences"
+    abs_data_dir: "/home/tony/erasor2_dataset/dataset/sequences"
     cloud_dir: ""
     cloud_format: ""
     pose_path: ""
@@ -57,11 +57,11 @@ erasor2:
         dist_thr_gain: 1.732
 
     viz_flag:
-        set_scan_and_pose: true
+        set_scan_and_pose: false
         set_submap: false
-        update: true
-        detect: true
-        over_seg: true
+        update: false
+        detect: false
+        over_seg: false
 
     save_map: true
 
@@ -74,3 +74,18 @@ extrinsic:
                 0, 1, 0,
                 0, 0, 1 ]
     translation: [ 0.0, 0.0, 0.0 ]
+
+# External-memory execution. This is the recommended mode for long sequences.
+streaming:
+    enabled: true
+    # Global maps are label-preserving voxelized whenever this many points are
+    # reached. Lower values reduce peak RAM but increase CPU time.
+    compact_threshold_points: 3000000
+    # Keep false for self-collected data whose labels/ directory contains
+    # dummy SemanticKITTI labels.
+    use_gt_labels: false
+
+rerun:
+    enabled: false
+    spawn: false
+    save_path: ""

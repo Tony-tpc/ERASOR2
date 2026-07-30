@@ -95,7 +95,6 @@ int ERASOR2::globalIdx2LocalIdx(const erasor2::Index &global_idx,
 }
 
 void ERASOR2::initializePointClouds() {
-  int num_pts_for_reserve = 5000000;
   map_noise_.reset(new pcl::PointCloud<pcl::PointXYZI>);
   map_dynamic_.reset(new pcl::PointCloud<pcl::PointXYZI>);
   map_accum_.reset(new pcl::PointCloud<pcl::PointXYZI>);
@@ -103,12 +102,6 @@ void ERASOR2::initializePointClouds() {
   static_map_accum_.reset(new pcl::PointCloud<pcl::PointXYZI>);
   static_map_voxelized_.reset(new pcl::PointCloud<pcl::PointXYZI>);
 
-  map_noise_->points.reserve(num_pts_for_reserve);
-  map_dynamic_->points.reserve(num_pts_for_reserve);
-  map_accum_->points.reserve(num_pts_for_reserve);
-  map_complement_->points.reserve(num_pts_for_reserve);
-  static_map_accum_->points.reserve(num_pts_for_reserve);
-  static_map_voxelized_->points.reserve(num_pts_for_reserve);
 }
 
 void ERASOR2::setScanAndPose(const Eigen::Matrix4f &pose_raw,
@@ -359,9 +352,9 @@ void ERASOR2::resize() {
 ParsedCurrCloud ERASOR2::parseCurrCloud(const pcl::PointCloud<pcl::PointXYZI> &cloud) {
   // Viz
   ParsedCurrCloud parsed_cloud;
-  parsed_cloud.non_ground_.reserve(5000000);
-  parsed_cloud.ground_.reserve(5000000);
-  parsed_cloud.noise_.reserve(1000000);
+  parsed_cloud.non_ground_.reserve(cloud.size());
+  parsed_cloud.ground_.reserve(cloud.size() / 2);
+  parsed_cloud.noise_.reserve(cloud.size() / 8);
 
   // If there exists some instances apart from the current frame, then some times max_ids_.back() <
   // getMaxInstanceId(cloud)
@@ -1810,4 +1803,276 @@ void ERASOR2::publishPose(int k) {
   // serves the same purpose (parents subsequent body-frame logs).
   erasor2::viz::setFrame(static_cast<int64_t>(k));
   PosePublisher.publish(poses_submap_[k]);
+}
+
+// ============================================================================
+// External-memory multi-pass implementation
+// ============================================================================
+namespace {
+void normalizeCloudMetadata(pcl::PointCloud<pcl::PointXYZI> &cloud) {
+  cloud.width = static_cast<std::uint32_t>(cloud.size());
+  cloud.height = cloud.empty() ? 0 : 1;
+  cloud.is_dense = true;
+}
+}  // namespace
+
+void ERASOR2::streamingBegin() {
+  is_initial_ = true;
+  new_origin_.setIdentity();
+  stream_poses_all_.clear();
+  stream_idxes_all_.clear();
+  stream_min_x_ = std::numeric_limits<float>::max();
+  stream_min_y_ = std::numeric_limits<float>::max();
+  stream_max_x_ = std::numeric_limits<float>::lowest();
+  stream_max_y_ = std::numeric_limits<float>::lowest();
+  map_accum_->clear();
+  static_map_accum_->clear();
+  static_map_voxelized_->clear();
+  map_noise_->clear();
+  map_dynamic_->clear();
+}
+
+void ERASOR2::streamingAccumulateFrame(
+    const Eigen::Matrix4f &pose_raw,
+    const pcl::PointCloud<pcl::PointXYZI> &cloud_est_label,
+    std::size_t compact_threshold_points) {
+  if (is_initial_) {
+    new_origin_ = pose_raw;
+    is_initial_ = false;
+  }
+
+  const Eigen::Matrix4f pose_submap = new_origin_.inverse() * pose_raw;
+  stream_poses_all_.emplace_back(pose_submap);
+
+  pcl::PointCloud<pcl::PointXYZI> cloud_voi;
+  pcl::PointCloud<pcl::PointXYZI> transformed;
+  pcl::PointCloud<pcl::PointXYZI> frame_voxelized;
+  maskNonVoI(cloud_est_label, cloud_voi, min_z_voi_, max_z_voi_);
+  pcl::transformPointCloud(
+      cloud_voi, transformed, pose_submap * tf_h_of_ground_to_be_zero_);
+  normalizeCloudMetadata(transformed);
+
+  for (const auto &pt : transformed) {
+    stream_min_x_ = std::min(stream_min_x_, pt.x);
+    stream_min_y_ = std::min(stream_min_y_, pt.y);
+    stream_max_x_ = std::max(stream_max_x_, pt.x);
+    stream_max_y_ = std::max(stream_max_y_, pt.y);
+  }
+
+  auto transformed_ptr = transformed.makeShared();
+  erasor_utils::voxelize_preserving_labels_by_nanoflann(
+      transformed_ptr, frame_voxelized, voxel_size_, minimum_num_per_voxel_);
+  (*map_accum_) += frame_voxelized;
+  normalizeCloudMetadata(*map_accum_);
+
+  // Bound temporary growth. Label-preserving voxelization is deliberately
+  // used instead of pcl::VoxelGrid because intensity stores instance IDs.
+  if (compact_threshold_points > 0 && map_accum_->size() >= compact_threshold_points) {
+    pcl::PointCloud<pcl::PointXYZI> compacted;
+    erasor_utils::voxelize_preserving_labels_by_nanoflann(
+        map_accum_, compacted, map_voxel_size_);
+    map_accum_->swap(compacted);
+    normalizeCloudMetadata(*map_accum_);
+  }
+}
+
+void ERASOR2::streamingFinalizeSubmap() {
+  if (stream_poses_all_.empty()) {
+    throw std::runtime_error("[streaming] no frames were accumulated");
+  }
+  pcl::PointCloud<pcl::PointXYZI> compacted;
+  erasor_utils::voxelize_preserving_labels_by_nanoflann(
+      map_accum_, compacted, map_voxel_size_);
+  map_accum_->swap(compacted);
+  normalizeCloudMetadata(*map_accum_);
+
+  num_data_ = static_cast<int>(stream_poses_all_.size());
+  grid_map_info_ = setGridMapParams(
+      stream_min_x_, stream_min_y_, stream_max_x_, stream_max_y_, grid_resolution_);
+  gridmap_submap_ = setMapcentricGridMap(grid_map_info_);
+
+  stream_idxes_all_.resize(stream_poses_all_.size());
+  for (std::size_t k = 0; k < stream_poses_all_.size(); ++k) {
+    erasor2::Position pos_xy(stream_poses_all_[k](0, 3), stream_poses_all_[k](1, 3));
+    if (!gridmap_submap_.getIndex(pos_xy, stream_idxes_all_[k])) {
+      throw std::runtime_error("[streaming] pose lies outside generated grid map");
+    }
+  }
+  std::cout << "[streaming] global map: " << map_accum_->size()
+            << " voxels, " << num_data_ << " frame poses\n";
+}
+
+void ERASOR2::streamingUpdateFrame(
+    std::size_t global_local_index,
+    const pcl::PointCloud<pcl::PointXYZI> &cloud_est_label) {
+  if (global_local_index >= stream_poses_all_.size()) {
+    throw std::out_of_range("[streaming] update frame index out of range");
+  }
+  if (global_local_index % static_cast<std::size_t>(std::max(1, update_interval_)) != 0) {
+    return;
+  }
+
+  const Eigen::Matrix4f &pose_submap = stream_poses_all_[global_local_index];
+  pcl::PointCloud<pcl::PointXYZI> cloud_voi;
+  pcl::PointCloud<pcl::PointXYZI> transformed;
+  maskNonVoI(cloud_est_label, cloud_voi, min_z_voi_, max_z_voi_);
+  pcl::transformPointCloud(
+      cloud_voi, transformed, pose_submap * tf_h_of_ground_to_be_zero_);
+  normalizeCloudMetadata(transformed);
+
+  const erasor2::Index &center_idx = stream_idxes_all_[global_local_index];
+  erasor2::Position pos_approx = idx2position(center_idx);
+
+  std::vector<pcl::PointCloud<pcl::PointXYZI>> scan_grid;
+  std::vector<pcl::PointCloud<pcl::PointXYZI>> map_grid;
+  pcl::PointCloud<pcl::PointXYZI> scan_complement;
+  pcl::PointCloud<pcl::PointXYZI> map_complement;
+  voi2xygrid(transformed,
+             pos_approx(0), pos_approx(1), pose_submap(2, 3),
+             range_of_interest_, grid_resolution_, scan_grid, scan_complement);
+  voi2xygrid(*map_accum_,
+             pos_approx(0), pos_approx(1), pose_submap(2, 3),
+             range_of_interest_, grid_resolution_, map_grid, map_complement);
+
+  if (scan_grid.size() != map_grid.size()) {
+    throw std::runtime_error("[streaming] scan/map grid size mismatch");
+  }
+
+  gridmap_submap_["elevation"].setConstant(NOT_UPDATED);
+  erasor2::Index idx;
+  std::size_t count = 0;
+  const int w_pc = center_idx(0);
+  const int h_pc = center_idx(1);
+  for (int h = h_pc - neighboring_height_ / 2; h < h_pc + neighboring_height_ / 2; ++h) {
+    for (int w = w_pc - neighboring_width_ / 2; w < w_pc + neighboring_width_ / 2; ++w) {
+      idx(0) = w;
+      idx(1) = h;
+      if (count >= scan_grid.size()) break;
+      if (isLikelyToBeSteppableRegionbyBinaryDescriptor(
+              scan_grid[count], map_grid[count], scan_ratio_threshold_, min_z_diff_thr_, verbose_)) {
+        gridmap_submap_.at("elevation", idx) = erasor_utils::calcMeanZOfGround(map_grid[count]);
+        gridmap_submap_.at("status", idx) = TEMPORARILY_OCCUPIED;
+        updateLogOdds(idx, increment_ * increment_gain_);
+      } else if (isLikelyToBeGround(scan_grid[count])) {
+        if (gridmap_submap_.at("status", idx) == NOT_OBSERVED) {
+          gridmap_submap_.at("status", idx) = GROUND_EXISTS;
+          gridmap_submap_.at("elevation", idx) = erasor_utils::calcMeanZOfGround(map_grid[count]);
+        }
+        updateLogOdds(idx, increment_);
+      }
+      ++count;
+    }
+  }
+}
+
+void ERASOR2::streamingFinalizeGrid() { logOddsGrid2probGrid(); }
+
+void ERASOR2::streamingReleaseGlobalMap() {
+  map_accum_.reset(new pcl::PointCloud<pcl::PointXYZI>);
+  map_complement_.reset(new pcl::PointCloud<pcl::PointXYZI>);
+  std::cout << "[streaming] released pass-1 global point map before pass 3\n";
+}
+
+void ERASOR2::streamingProcessWindow(
+    const std::vector<Eigen::Matrix4f> &poses_raw,
+    const std::vector<pcl::PointCloud<pcl::PointXYZI>> &clouds_est_label,
+    std::size_t center_index,
+    pcl::PointCloud<pcl::PointXYZI> &source_transformed,
+    pcl::PointCloud<pcl::PointXYZI> &static_transformed,
+    pcl::PointCloud<pcl::PointXYZI> &dynamic_transformed,
+    pcl::PointCloud<pcl::PointXYZI> &potential_dynamic_transformed) {
+  if (poses_raw.size() != clouds_est_label.size() || poses_raw.empty() ||
+      center_index >= poses_raw.size()) {
+    throw std::invalid_argument("[streaming] invalid temporal window");
+  }
+
+  // Reset only window-sized legacy buffers. This lets the mature detection,
+  // over-segmentation and VOR implementation run unchanged while bounding RAM.
+  pcs_transformed_.clear();
+  pcs_gt_transformed_.clear();
+  poses_submap_.clear();
+  max_ids_.clear();
+  xygrids_.clear();
+  idxes_approx_.clear();
+  rejected_objs_set_.clear();
+  accepted_objs_set_.clear();
+  noisy_points_transformed_.clear();
+  static_points_transformed_.clear();
+  dynamic_points_transformed_.clear();
+  potential_dynamic_points_transformed_.clear();
+  ids_instances_set_.clear();
+  map_noise_->clear();
+  map_dynamic_->clear();
+
+  for (std::size_t i = 0; i < clouds_est_label.size(); ++i) {
+    const Eigen::Matrix4f pose_submap = new_origin_.inverse() * poses_raw[i];
+    pcl::PointCloud<pcl::PointXYZI> cloud_voi;
+    pcl::PointCloud<pcl::PointXYZI> transformed;
+    maskNonVoI(clouds_est_label[i], cloud_voi, min_z_voi_, max_z_voi_);
+    pcl::transformPointCloud(
+        cloud_voi, transformed, pose_submap * tf_h_of_ground_to_be_zero_);
+    normalizeCloudMetadata(transformed);
+    poses_submap_.emplace_back(pose_submap);
+    pcs_transformed_.emplace_back(std::move(transformed));
+    // For custom datasets the SemanticKITTI labels are dummy data. Keeping the
+    // same geometry here preserves the mask indexing without loading a second
+    // full cloud from disk.
+    pcs_gt_transformed_.emplace_back(pcs_transformed_.back());
+    max_ids_.emplace_back(getMaxInstanceId(pcs_transformed_.back()));
+  }
+
+  num_data_ = static_cast<int>(pcs_transformed_.size());
+  resize();
+  for (int k = 0; k < num_data_; ++k) {
+    erasor2::Position pos_xy(poses_submap_[k](0, 3), poses_submap_[k](1, 3));
+    gridmap_submap_.getIndex(pos_xy, idxes_approx_[k]);
+    erasor2::Position pos_approx = idx2position(idxes_approx_[k]);
+    pcl::PointCloud<pcl::PointXYZI> complement;
+    voi2xygrid(pcs_transformed_[k],
+               pos_approx(0), pos_approx(1), poses_submap_[k](2, 3),
+               range_of_interest_, grid_resolution_, xygrids_[k], complement);
+  }
+
+  detectMovingObjects();
+  filterDynamicObjects();
+
+  source_transformed = pcs_transformed_.at(center_index);
+  static_transformed = static_points_transformed_.at(center_index);
+  dynamic_transformed = dynamic_points_transformed_.at(center_index);
+  potential_dynamic_transformed = potential_dynamic_points_transformed_.at(center_index);
+  normalizeCloudMetadata(source_transformed);
+  normalizeCloudMetadata(static_transformed);
+  normalizeCloudMetadata(dynamic_transformed);
+  normalizeCloudMetadata(potential_dynamic_transformed);
+}
+
+void ERASOR2::streamingAppendStaticResult(
+    const pcl::PointCloud<pcl::PointXYZI> &static_transformed,
+    std::size_t compact_threshold_points) {
+  if (static_transformed.empty()) return;
+  pcl::PointCloud<pcl::PointXYZI> world;
+  pcl::transformPointCloud(static_transformed, world, new_origin_);
+  (*static_map_accum_) += world;
+  normalizeCloudMetadata(*static_map_accum_);
+  if (compact_threshold_points > 0 &&
+      static_map_accum_->size() >= compact_threshold_points) {
+    pcl::PointCloud<pcl::PointXYZI> compacted;
+    erasor_utils::voxelize_preserving_labels_by_nanoflann(
+        static_map_accum_, compacted, map_voxel_size_);
+    static_map_accum_->swap(compacted);
+    normalizeCloudMetadata(*static_map_accum_);
+  }
+}
+
+void ERASOR2::streamingSaveStaticMap(const string &static_map_path) {
+  pcl::PointCloud<pcl::PointXYZI> compacted;
+  erasor_utils::voxelize_preserving_labels_by_nanoflann(
+      static_map_accum_, compacted, map_voxel_size_);
+  static_map_voxelized_->swap(compacted);
+  normalizeCloudMetadata(*static_map_voxelized_);
+  if (pcl::io::savePCDFileBinaryCompressed(static_map_path, *static_map_voxelized_) != 0) {
+    throw std::runtime_error("[streaming] failed to save static map: " + static_map_path);
+  }
+  std::cout << "[streaming] saved " << static_map_voxelized_->size()
+            << " static voxels to " << static_map_path << "\n";
 }

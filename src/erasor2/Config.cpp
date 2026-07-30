@@ -126,6 +126,13 @@ Config Config::fromYaml(const std::string& yaml_path) {
 
   c.save_map = get<bool>(root, "erasor2.save_map", c.save_map);
 
+  c.streaming_enabled =
+      get<bool>(root, "streaming.enabled", c.streaming_enabled);
+  c.streaming_compact_threshold = get<std::size_t>(
+      root, "streaming.compact_threshold_points", c.streaming_compact_threshold);
+  c.streaming_use_gt_labels =
+      get<bool>(root, "streaming.use_gt_labels", c.streaming_use_gt_labels);
+
   c.grid_resolution = get<float>(root, "erasor2.grid_resolution", c.grid_resolution);
   c.egocentric_grid_resolution =
       get<float>(root, "erasor2.egocentric_grid_resolution", c.egocentric_grid_resolution);

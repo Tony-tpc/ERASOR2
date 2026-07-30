@@ -5,10 +5,12 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/registration/gicp.h>
+#include <unordered_set>
 
 #include "erasor2/Config.hpp"
 #include "erasor2/RerunLogger.hpp"
 #include "erasor2/erasor2.h"
+#include "erasor2/progress_bar.hpp"
 
 #include "dataloader/dataloader.h"
 #include "dataprocessor/TrajectoryClustering.hpp"
@@ -36,6 +38,147 @@ vector<Eigen::Vector3f> getPoses(const DataLoader &loader,
   }
   return positions;
 }
+
+
+namespace {
+
+void loadFilteredEstimatedFrame(DataLoader &loader,
+                                ERASOR2 &engine,
+                                std::size_t frame_idx,
+                                pcl::PointCloud<pcl::PointXYZI> &cloud,
+                                Eigen::Matrix4f &pose) {
+  pcl::PointCloud<pcl::PointXYZI> raw;
+  pcl::PointCloud<pcl::PointXYZI> rejected;
+  loader.getScanAndPose(frame_idx, raw, pose);
+  loader.rejectNeighboringPoints(raw, engine.robot_body_size_, cloud, rejected);
+  cloud.width = static_cast<std::uint32_t>(cloud.size());
+  cloud.height = cloud.empty() ? 0 : 1;
+  cloud.is_dense = true;
+}
+
+int runExternalMemoryStreaming(
+    const erasor2::Config &cfg,
+    RosParamServer &params,
+    DataLoader &loader,
+    const std::vector<std::vector<std::size_t>> &frames_clusters,
+    const std::string &dynamic_label_root) {
+  if (params.correct_poses_by_submap_matching_) {
+    throw std::runtime_error(
+        "streaming.enabled is incompatible with pose_corrector.correct_poses_by_submap_matching; "
+        "pre-correct the trajectory or disable streaming for that preprocessing step");
+  }
+
+  const std::size_t compact_threshold =
+      std::max<std::size_t>(100000, cfg.streaming_compact_threshold);
+  const int requested_window = std::max(1, params.window_size_);
+  const int window_size = (requested_window % 2 == 0) ? requested_window + 1 : requested_window;
+  const int half_window = window_size / 2;
+
+  std::cout << "[streaming] enabled: three-pass external-memory mode\n"
+            << "[streaming] temporal window: " << window_size << " frames\n"
+            << "[streaming] compact threshold: " << compact_threshold << " points\n";
+
+  int cluster_id = 0;
+  for (const auto &interest_indices : frames_clusters) {
+    std::vector<std::size_t> frames = interest_indices;
+    if (params.expansion_range_ > 0) {
+      const auto expanded = getExpandedFrameNums(interest_indices,
+                                                  params.expansion_range_,
+                                                  params.end_frame_);
+      frames.insert(frames.end(), expanded.begin(), expanded.end());
+    }
+    std::sort(frames.begin(), frames.end());
+    frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+    const std::unordered_set<std::size_t> interest_set(
+        interest_indices.begin(), interest_indices.end());
+
+    if (frames.empty()) continue;
+    ERASOR2 engine(cfg);
+    engine.streamingBegin();
+
+    // PASS 1: build a compact global labelled voxel map.
+    erasor2::ProgressBar pass1("[streaming] pass 1 map", frames.size(), erasor2::color::kGreen);
+    for (std::size_t local = 0; local < frames.size(); ++local) {
+      pcl::PointCloud<pcl::PointXYZI> cloud;
+      Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+      loadFilteredEstimatedFrame(loader, engine, frames[local], cloud, pose);
+      engine.streamingAccumulateFrame(pose, cloud, compact_threshold);
+      pass1.tick(local + 1);
+    }
+    pass1.finish();
+    engine.streamingFinalizeSubmap();
+
+    // PASS 2: replay scans to update the global ground/steppable grid.
+    erasor2::ProgressBar pass2("[streaming] pass 2 grid", frames.size(), erasor2::color::kYellow);
+    for (std::size_t local = 0; local < frames.size(); ++local) {
+      pcl::PointCloud<pcl::PointXYZI> cloud;
+      Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+      loadFilteredEstimatedFrame(loader, engine, frames[local], cloud, pose);
+      engine.streamingUpdateFrame(local, cloud);
+      pass2.tick(local + 1);
+    }
+    pass2.finish();
+    engine.streamingFinalizeGrid();
+    engine.streamingReleaseGlobalMap();
+
+    // PASS 3: load only a bounded symmetric temporal window. The original
+    // detection, over-segmentation and VOR code runs on that window, then the
+    // center frame is immediately written and released.
+    erasor2::ProgressBar pass3("[streaming] pass 3 filter", frames.size(), erasor2::color::kCyan);
+    for (std::size_t center = 0; center < frames.size(); ++center) {
+      const std::size_t lower = center > static_cast<std::size_t>(half_window)
+                                    ? center - half_window
+                                    : 0;
+      const std::size_t upper = std::min(
+          frames.size(), center + static_cast<std::size_t>(half_window) + 1);
+
+      std::vector<Eigen::Matrix4f> window_poses;
+      std::vector<pcl::PointCloud<pcl::PointXYZI>> window_clouds;
+      window_poses.reserve(upper - lower);
+      window_clouds.reserve(upper - lower);
+      for (std::size_t j = lower; j < upper; ++j) {
+        pcl::PointCloud<pcl::PointXYZI> cloud;
+        Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+        loadFilteredEstimatedFrame(loader, engine, frames[j], cloud, pose);
+        window_poses.emplace_back(pose);
+        window_clouds.emplace_back(std::move(cloud));
+      }
+
+      pcl::PointCloud<pcl::PointXYZI> source;
+      pcl::PointCloud<pcl::PointXYZI> stat;
+      pcl::PointCloud<pcl::PointXYZI> dyn;
+      pcl::PointCloud<pcl::PointXYZI> potential;
+      engine.streamingProcessWindow(window_poses,
+                                    window_clouds,
+                                    center - lower,
+                                    source,
+                                    stat,
+                                    dyn,
+                                    potential);
+
+      engine.streamingAppendStaticResult(stat, compact_threshold);
+      if (interest_set.count(frames[center]) != 0) {
+        erasor_utils::save_dyn_label(
+            dynamic_label_root, frames[center], source, dyn, potential);
+      }
+      pass3.tick(center + 1);
+    }
+    pass3.finish();
+
+    if (params.save_map_) {
+      const std::string map_path =
+          params.abs_save_dir_ + "/" + params.sequence_ + "_" +
+          std::to_string(cluster_id) + "_frame_" +
+          std::to_string(frames.front()) + "_to_" +
+          std::to_string(frames.back()) + "_streaming_estimated.pcd";
+      engine.streamingSaveStaticMap(map_path);
+    }
+    ++cluster_id;
+  }
+  return 0;
+}
+
+}  // namespace
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -102,6 +245,13 @@ int main(int argc, char **argv) {
       indices_tmp.emplace_back(i);
     }
     frames_clusters.emplace_back(indices_tmp);
+  }
+
+  if (cfg.streaming_enabled) {
+    const int rc = runExternalMemoryStreaming(
+        cfg, *params, *loader, frames_clusters, dynamic_label_root);
+    erasor2::viz::shutdown();
+    return rc;
   }
 
   std::cout << "\033[1;32mStart to run ERASOR2\033[0m" << std::endl;

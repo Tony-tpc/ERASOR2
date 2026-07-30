@@ -218,15 +218,16 @@ python -m pip install -U pip setuptools wheel
 
 ```bash
 pip install \
-  numpy \
-  open3d \
-  hdbscan \
-  scikit-learn \
-  pypatchworkpp \
-  tqdm \
-  tabulate \
-  PyYAML \
-  rerun-sdk
+  "numpy>=1.18.0" \
+  "matplotlib>=3.3.0" \
+  "scikit-learn>=0.24.0" \
+  "hdbscan>=0.8.28" \
+  "tqdm>=4.62.0" \
+  "tabulate>=0.8.9" \
+  "PyYAML" \
+  "open3d>=0.15.0" \
+  "pypatchworkpp>=1.3.1" \
+  "rerun-sdk>=0.21"
 ```
 
 如果 `kitti_clustering.py` 报：
