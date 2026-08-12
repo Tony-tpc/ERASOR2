@@ -30,13 +30,19 @@ if __name__ == "__main__":
         description="Run Patchwork++ ground segmentation + HDBSCAN instance "
         "clustering over SemanticKITTI / HeLiMOS frames."
     )
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "--kitti_dir",
-        required=True,
         help="Dataset root. For SemanticKITTI, this is the directory ABOVE "
         "'dataset/' (e.g. /home/url/datasets/kitti, so that "
         "<kitti_dir>/dataset/sequences/<seq>/velodyne/ exists). For HeLiMOS, "
         "this is the directory directly containing the sequence subfolders.",
+    )
+    input_group.add_argument(
+        "--sequence-dir",
+        help="Direct path to one sequence directory containing velodyne/. "
+        "This is useful for self-collected datasets and avoids requiring a "
+        "particular dataset-root layout.",
     )
     parser.add_argument(
         "--save_dir",
@@ -71,12 +77,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    kitti_dir = args.kitti_dir.rstrip("/")
+    kitti_dir = args.kitti_dir.rstrip("/") if args.kitti_dir else ""
 
     # Determine dataset type and resolve the per-sequence base directory that
-    # holds velodyne/ (and labels/). SemanticKITTI lives under
+    # holds velodyne/ (and labels/). A direct sequence path is the least
+    # ambiguous input for custom data. SemanticKITTI lives under
     # <root>/dataset/sequences/<seq>/; HeLiMOS lives directly under <root>/<seq>/.
-    if args.seq == "Merged":
+    if args.sequence_dir:
+        data_base = str(Path(args.sequence_dir).expanduser().resolve())
+        dataset_type = "direct sequence"
+    elif args.seq == "Merged":
         dataset_type = "HeLiMOS"
         data_base = kitti_dir + "/" + args.seq
     else:

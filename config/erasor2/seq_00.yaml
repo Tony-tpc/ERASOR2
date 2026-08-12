@@ -1,5 +1,5 @@
 start_frame: 0
-end_frame: 2700
+end_frame: -1
 viz_interval: 10
 is_large_scale: false
 
@@ -14,9 +14,9 @@ dataloader:
     abs_save_dir: "/home/tony/erasor2_output"
     instance_seg_method: "hdbscan"
 
-    accum_interval: 2
-    voxel_size: 0.05
-    map_voxel_size: 0.05
+    accum_interval: 1
+    voxel_size: 0.1
+    map_voxel_size: 0.1
 
     expansion_range: 0
 
@@ -27,34 +27,34 @@ erasor2:
 
     min_z_voi: -1.5
     max_z_voi: 2.3
-    min_z_diff_thr: 0.3
-    scan_ratio_threshold: 0.2
+    min_z_diff_thr: 0.25
+    scan_ratio_threshold: 0.3
 
     log_odds:
-        increment_gain: 2.0
+        increment_gain: 2.5
         increment: 0.15
 
-    region_proposal_thr: 0.8
+    region_proposal_thr: 0.7
     kernel_size: 1
 
-    ratio_num_pts: 0.95
-    minimum_num_pts: 5
+    ratio_num_pts: 0.88
+    minimum_num_pts: 4
 
     moving_object_detection:
-        negative_log_odds: -2.0
-        obj_score_soft_thr: 4.6
-        obj_score_hard_thr: 14.0
-        hard_thr_radius: 10.0
+        negative_log_odds: -1.2
+        obj_score_soft_thr: 3.0
+        obj_score_hard_thr: 8.0
+        hard_thr_radius: 1.0
 
     over_segmentation:
         minimum_area_thr: 8
         ratio_of_unknown_prior: 0.25
 
     volumetric_outlier_removal:
-        window_size: 1
+        window_size: 3
         use_adaptive_voxel_size: true
-        vor_cand_score_thr: 4.6
-        dist_thr_gain: 1.732
+        vor_cand_score_thr: 3.5
+        dist_thr_gain: 2.0
 
     viz_flag:
         set_scan_and_pose: false

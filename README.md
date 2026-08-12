@@ -1,881 +1,528 @@
-# Adaptive-LIO 导出 ERASOR2 数据集使用说明
+# ERASOR2：动态物体去除与静态点云地图生成
 
-本文档说明如何使用修改后的 **Adaptive-LIO_KITTI** 生成 ERASOR2 所需的数据集，并用修改后的 **ERASOR2** 完成动态障碍物去除，最终输出干净的静态点云地图。
-
----
-
-## 1. 当前版本做了什么
-
-当前 Adaptive-LIO 导出版的目标是：
+本仓库在 [url-kaist/ERASOR2](https://github.com/url-kaist/ERASOR2) 的算法基础上，
+提供了一套面向离线 LiDAR sequence 的完整处理流程。输入逐帧点云、LiDAR 位姿和
+一份 YAML 参数文件，即可生成原始累计地图、动态物体过滤后的静态地图，以及逐帧
+MOS 标签。
 
 ```text
-rosbag / 在线雷达数据
-    ↓
-Adaptive-LIO 建图/定位
-    ↓
-同步导出 ERASOR2 / KITTI 风格数据集
-    ↓
-ERASOR2 生成 ground label / instance label
-    ↓
-mapgen 构建初始地图
-    ↓
-run_erasor2 删除动态障碍物
-    ↓
-输出 clean / static map
+逐帧点云 + LiDAR 位姿
+        │
+        ├── Patchwork++：地面分割
+        ├── HDBSCAN：实例聚类
+        │
+        ├── mapgen：生成原始累计地图
+        │
+        └── ERASOR2：检测并去除动态物体
+                    ├── 静态点云地图
+                    └── 逐帧 MOS 标签
 ```
 
-当前版本保留了：
+## 相比 url-kaist 原版的主要改进
 
-```text
-1. 主雷达点云导出
-2. aux 副雷达点云导出
-3. cloud_pub.min_z_filter / max_z_filter 高度限制
-4. 每帧 .bin 点云
-5. 每帧 pose
-6. times.txt
-```
+本分支的优势主要是工程化、数据接入和长序列运行能力。ERASOR2 的核心思想仍来自
+原论文；下列改进不代表在所有数据集上必然获得更高的 PR、RR 或 F1。
 
-输出格式为 SemanticKITTI / KITTI 风格：
+| 项目 | url-kaist 原版 | 当前版本 |
+|---|---|---|
+| 构建与运行 | 依赖 ROS1、catkin、rosparam 和 roslaunch | 纯 CMake/C++17，程序直接读取 YAML，不需要 ROS master 或 catkin 工作空间 |
+| Grid Map | 依赖 ROS 生态中的 `grid_map` 包 | 内置算法实际需要的轻量 Grid Map 实现，减少系统依赖 |
+| 自采 sequence 接入 | 通常需要手工整理路径、标签并逐项启动 | `run_sequence.sh` 只接收 sequence 路径和参数文件，自动完成检查、预处理与执行 |
+| 位姿输入 | SemanticKITTI/SuMa 相机位姿转换流程 | 直接读取 `T_map_lidar`，支持 KITTI 3×4 和时间戳加四元数两种格式，更适合直接输出 LiDAR 位姿的系统 |
+| 长序列内存 | 主要以内存中的完整序列和地图运行 | 提供三遍式 external-memory streaming，按阈值压缩全局地图，并仅保留时间窗口 |
+| 可视化 | RViz、TF 和 ROS publisher | Rerun 可选；默认可完全关闭，适合无桌面的服务器和批处理 |
+| 输出与复现 | 主要面向论文数据集流程 | 同时输出静态地图和逐帧 MOS 标签；提供 pipeline、benchmark 和 parity 检查工具 |
+| ERASOR 版本 | ERASOR2 | 同一次 CMake 构建还可生成 ERASOR v1 的 `run_erasor`，便于横向比较 |
 
-```text
-erasor2_dataset/
-└── dataset/
-    └── sequences/
-        └── 00/
-            ├── velodyne/
-            │   ├── 000000.bin
-            │   ├── 000001.bin
-            │   └── ...
-            ├── poses_suma_optim.txt
-            ├── times.txt
-            ├── labels/
-            ├── patchwork/
-            └── hdbscan/
-```
+当前版本把位姿文件解释为直接的 `T_map_lidar`。如果已有的是相机位姿或其他传感器
+坐标系位姿，必须先用外参转换到 LiDAR 位姿；否则轨迹方向和点云地图可能不一致。
 
-其中：
+## 运行环境
 
-```text
-velodyne/*.bin          每一帧点云，float32: x y z intensity
-poses_suma_optim.txt    每一帧全局位姿，KITTI 3x4 row-major
-times.txt               每一帧时间戳
-labels/*.label          SemanticKITTI 语义标签，可用 dummy 全 0 标签
-patchwork/*.label       Patchwork++ 生成的 ground label
-hdbscan/*.label         HDBSCAN 生成的 instance label
-```
-
----
-
-
-## 3. Adaptive-LIO 侧配置
-
-打开 Adaptive-LIO 配置，例如：
+推荐 Ubuntu 20.04 或 22.04。C++ 部分需要：
 
 ```bash
-gedit config/mapping_m.yaml
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake git \
+  libpcl-dev libeigen3-dev libopencv-dev libomp-dev \
+  libboost-system-dev libboost-filesystem-dev \
+  libyaml-cpp-dev libopenmpi-dev
 ```
 
-确认 mapping 模块开启：
-
-```yaml
-mapping_module:
-  enable_mapping: true
-  export_erasor2: true
-  erasor2_save_dir: "./erasor2_dataset/"
-  sequence_id: "00"
-  record_every_frame: true
-```
-
-确认 cloud_pub 高度限制：
-
-```yaml
-cloud_pub:
-  max_z_filter: 1.5
-  min_z_filter: -1.0
-  enable_body_filter: true
-```
-
-当前 aux-height 版本会把高度限制重新加入 ERASOR2 导出。也就是说，导出的 `velodyne/*.bin` 会受到：
-
-```text
-min_z_filter <= z <= max_z_filter
-```
-
-限制。
-
-如需关闭高度裁剪，可把范围放宽，例如：
-
-```yaml
-cloud_pub:
-  max_z_filter: 3.0
-  min_z_filter: -2.0
-```
-
-或者根据实际场地调节。
-
----
-
-## 4. 运行 Adaptive-LIO 并导出数据
-
-先删除旧数据，避免新旧帧混在一起：
+Python 部分用于 Patchwork++、HDBSCAN 预处理和结果评估。推荐使用仓库提供的 Conda
+环境：
 
 ```bash
-cd /home/sb/Eraser_for_dynamic/Adaptive-LIO
-
-rm -rf erasor2_dataset
-mkdir -p erasor2_dataset
+conda env create -f scripts/environment.yml
+conda activate erasor2
 ```
 
-编译 Adaptive-LIO：
-
-```bash
-colcon build --symlink-install
-source install/setup.bash
-```
-
-启动 Adaptive-LIO：
-
-```bash
-ros2 launch <你的包名> <你的launch文件>.py
-```
-
-然后播放 rosbag：
-
-```bash
-ros2 bag play <你的rosbag路径>
-```
-
-播放结束后，检查输出目录：
-
-```bash
-SEQ=/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-
-echo "bin:"   $(ls $SEQ/velodyne/*.bin 2>/dev/null | wc -l)
-echo "poses:" $(wc -l < $SEQ/poses_suma_optim.txt)
-echo "times:" $(wc -l < $SEQ/times.txt)
-```
-
-正常情况下三者数量必须一致，例如：
-
-```text
-bin:   2764
-poses: 2764
-times: 2764
-```
-
-如果数量不一致，不要继续跑 ERASOR2，应先检查导出流程。
-
----
-
-## 5. 生成 dummy SemanticKITTI labels
-
-自采数据没有 SemanticKITTI 官方人工语义标签，但 ERASOR2 的 SemanticKITTI dataloader 会读取：
-
-```text
-labels/000000.label
-labels/000001.label
-...
-```
-
-因此需要生成 dummy label。每个 `.label` 文件必须和对应 `.bin` 点数一致，类型为 `uint32`。
-在adaptive根目录运行：
-
-```bash
-python3 scripts/make_dummy_semantickitti_labels.py \
-  /home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-```
-
-检查：
-
-```bash
-SEQ=/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-
-echo "labels:" $(ls $SEQ/labels/*.label 2>/dev/null | wc -l)
-```
-
-应与 `velodyne/*.bin` 数量一致。
-
----
-
-## 6. ERASOR2 环境准备，不使用 conda
-
-进入 ERASOR2：
-
-```bash
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-```
-
-创建 Python venv：
+也可以使用 venv：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
 python -m pip install -U pip setuptools wheel
+python -m pip install -r scripts/requirements.txt PyYAML
 ```
 
-安装 Python 依赖：
+### 编译
+
+默认构建为无可视化的 headless 版本，不会下载 Rerun C++ SDK：
 
 ```bash
-pip install \
-  "numpy>=1.18.0" \
-  "matplotlib>=3.3.0" \
-  "scikit-learn>=0.24.0" \
-  "hdbscan>=0.8.28" \
-  "tqdm>=4.62.0" \
-  "tabulate>=0.8.9" \
-  "PyYAML" \
-  "open3d>=0.15.0" \
-  "pypatchworkpp>=1.3.1" \
-  "rerun-sdk>=0.21"
+cmake -S . -B build
+cmake --build build -j"$(nproc)"
 ```
 
-如果 `kitti_clustering.py` 报：
+主要生成以下程序：
+
+| 程序 | 用途 |
+|---|---|
+| `build/mapgen` | 累积原始扫描并生成原始/体素化地图 |
+| `build/run_erasor2` | 运行 ERASOR2，输出静态地图和 MOS 标签 |
+| `build/run_erasor` | 运行 ERASOR v1，便于与 ERASOR2 对比 |
+| `build/compare_map` | 比较地图 |
+| `build/accum_4dmos` | 累积外部 4D-MOS 结果 |
+
+如需 Rerun 可视化，配置时显式开启：
+
+```bash
+cmake -S . -B build -DERASOR2_ENABLE_RERUN=ON
+cmake --build build -j"$(nproc)"
+```
+
+## 输入数据
+
+### Sequence 目录结构
+
+推荐使用 SemanticKITTI 风格目录。一个 sequence 应类似：
 
 ```text
-AttributeError: module 'numpy' has no attribute 'in1d'
+/data/sequences/00/
+├── velodyne/
+│   ├── 000000.bin
+│   ├── 000001.bin
+│   └── ...
+├── poses_suma_optim.txt
+├── times.txt                  # 可选，当前核心程序不读取
+├── labels/                    # 真实语义标签或 dummy label
+├── patchwork/                 # 可由脚本生成
+└── hdbscan/                   # 可由脚本生成
 ```
 
-说明 NumPy 版本较新。把 ERASOR2 脚本中的 `np.in1d` 改成 `np.isin`：
+帧文件建议从 `000000` 开始连续编号。配置中的 frame 编号直接用于寻找
+`%06d.bin` 和 `%06d.label`。
 
-```bash
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-sed -i 's/np\.in1d(/np.isin(/g' scripts/pcd_preprocess.py
-```
+### 输入文件格式
 
----
+| 输入 | 格式 | 是否必需 |
+|---|---|---|
+| `velodyne/NNNNNN.bin` | 连续 `float32`，每点为 `x y z intensity`，共 16 字节 | 必需 |
+| `poses_suma_optim.txt` | 每行一个直接的 `T_map_lidar` | SemanticKITTI/custom 模式必需 |
+| `poses.txt` | 每行一个直接的 LiDAR 位姿 | `dataset_name: HeLiPR` 时必需 |
+| `labels/NNNNNN.label` | 每点一个 `uint32` SemanticKITTI 标签 | `mapgen` 必需；无真值时可使用全零 dummy label |
+| `patchwork/NNNNNN.label` | 每点一个 `uint32`，非零表示地面 | `run_erasor2` 必需，可自动生成 |
+| `hdbscan/NNNNNN.label` | 每点一个 `uint32`，高 16 位保存 instance ID | 使用 HDBSCAN 时必需，可自动生成 |
 
-## 7. 编译 ERASOR2
-
-安装系统依赖：
-
-```bash
-sudo apt update
-sudo apt install -y \
-  build-essential cmake git \
-  libpcl-dev libeigen3-dev libopencv-dev libomp-dev \
-  libboost-system-dev libboost-filesystem-dev \
-  libyaml-cpp-dev
-```
-
-编译：
-
-```bash
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-
-cmake -B build -S .
-cmake --build build -j$(nproc)
-```
-
-如果编译时下载 Arrow / Rerun 失败，通常是代理或 GitHub 网络问题。可以先检查下载：
-
-```bash
-curl -L \
-  https://github.com/apache/arrow/releases/download/apache-arrow-18.0.0/apache-arrow-18.0.0.tar.gz \
-  -o /tmp/apache-arrow-18.0.0.tar.gz
-```
-
-如果代理异常，可临时取消代理：
-
-```bash
-unset http_proxy
-unset https_proxy
-unset HTTP_PROXY
-unset HTTPS_PROXY
-unset all_proxy
-unset ALL_PROXY
-```
-
-然后重新编译。
-
----
-
-## 8. 生成 Patchwork ground label 和 HDBSCAN instance label
-
-ERASOR2 运行前必须生成：
+位姿支持两种行格式：
 
 ```text
-patchwork/*.label
-hdbscan/*.label
+# KITTI row-major 3x4，共 12 个数
+r00 r01 r02 tx r10 r11 r12 ty r20 r21 r22 tz
+
+# 时间戳 + 平移 + 四元数，共 8 个数
+timestamp x y z qx qy qz qw
 ```
 
-先查看最后一帧编号：
+点云与位姿必须使用同一个 LiDAR 坐标系、相同帧顺序和相同时间基准。代码不会进行
+点云去畸变、时间同步或外参标定。
+
+### Dummy label 的含义
+
+自采数据没有语义真值时，可以为每个点写入 `uint32(0)`。这样可以让 `mapgen`
+生成几何累计地图，但该地图不包含真实的动态/静态语义，因此不能据此计算可信的
+Preservation、Rejection 或 F1。已有真实 `labels/` 时不要替换为 dummy label。
+
+## 输出数据
+
+假设 sequence 为 `00`，处理区间为 `0..3450`，输出目录包含：
+
+```text
+erasor2_output/
+├── effective_config.yaml                         # 仅一键脚本生成
+├── 00_0_to_3450_w_interval_1_voxel_0_1_original.pcd
+├── 00_0_to_3450_w_interval_1_voxel_0_1.pcd
+├── 00_0_frame_0_to_3450_streaming_estimated.pcd # streaming 模式
+└── mos/
+    ├── 000000.label
+    ├── 000001.label
+    └── ...
+```
+
+| 输出 | 含义 |
+|---|---|
+| `*_original.pcd` | `mapgen` 生成的未做最终 map voxel 的累计地图 |
+| `*_w_interval_*_voxel_*.pcd` | `mapgen` 生成的体素化原始累计地图 |
+| `*_streaming_estimated.pcd` | streaming 模式生成的静态地图 |
+| `*_estimated.pcd` | 关闭 streaming 时生成的静态地图 |
+| `mos/*.label` | SemanticKITTI MOS 风格标签：静态为 `0`，动态为 `251` |
+| `effective_config.yaml` | 一键脚本覆盖数据路径、sequence、输出路径和安全帧范围后的实际配置 |
+
+## 一键运行：推荐方式
+
+只需要准备 sequence 路径和参数文件：
 
 ```bash
-SEQ=/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-ls $SEQ/velodyne | tail
+./scripts/run_sequence.sh \
+  /data/sequences/00 \
+  config/erasor2/seq_00.yaml
 ```
 
-如果最后一个文件是：
+脚本会依次完成：
 
-```text
-002763.bin
-```
+1. 检查点云文件、位姿数量、帧区间和点云字节数。
+2. 根据需要执行 CMake 编译。
+3. 为缺少语义真值的帧创建 dummy label，不覆盖已有 label。
+4. 检查并复用已有 Patchwork/HDBSCAN 标签；缺失时自动生成。
+5. 运行 `mapgen`。
+6. 运行 `run_erasor2`。
 
-则总帧范围是：
+脚本不会修改传入的 YAML，而是把路径相关字段写入输出目录中的
+`effective_config.yaml`：
 
-```text
-0 到 2763
-```
+- `dataloader.abs_data_dir` 自动设为 sequence 的父目录；
+- `dataloader.sequence` 自动设为 sequence 目录名；
+- `dataloader.abs_save_dir` 自动设为输出目录；
+- `end_frame: -1` 时自动选择当前数据能安全处理到的最后一帧；
+- 指定的末帧超出点云或位姿范围时，自动向下收缩并按 `accum_interval` 对齐。
 
-运行：
+默认输出到 `<sequence>/erasor2_output/`。常用环境变量：
 
 ```bash
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-source .venv/bin/activate
-
-python scripts/kitti_clustering.py \
-  --kitti_dir /home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset \
-  --seq 00 \
-  --init_stamp 0 \
-  --end_stamp 2763 \
-  --save-instance-labels \
-  --save-ground-labels
+ERASOR2_OUTPUT_DIR=/data/output \
+ERASOR2_PYTHON=/opt/conda/envs/erasor2/bin/python \
+ERASOR2_BUILD_DIR=./build \
+./scripts/run_sequence.sh /data/sequences/00 config/erasor2/seq_00.yaml
 ```
 
-注意：`--kitti_dir` 必须是：
+| 环境变量 | 作用 |
+|---|---|
+| `ERASOR2_OUTPUT_DIR` | 修改输出目录 |
+| `ERASOR2_PYTHON` | 指定带预处理依赖的 Python |
+| `ERASOR2_CONDA_ENV` | 指定 Conda 环境根目录，作为 `ERASOR2_PYTHON` 的替代 |
+| `ERASOR2_BUILD_DIR` | 指定 CMake build 目录 |
+| `ERASOR2_JOBS` | 指定并行编译任务数 |
+| `ERASOR2_FORCE_LABELS=1` | 强制重新生成 Patchwork/HDBSCAN 标签 |
 
-```text
-/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset
-```
+如果当前参数使用 `instance_seg_method: cais`，一键脚本只会复用已有 CAIS 标签，
+不会自动生成 CAIS；自动预处理目前只生成 HDBSCAN。
 
-而不是：
+## 手动分步运行
 
-```text
-/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences
-```
-
-因为脚本内部会自动拼：
-
-```text
-<kitti_dir>/dataset/sequences/00/velodyne
-```
-
-生成后检查：
+手动运行适合调试预处理结果、单独调参或复用已有标签。以下示例假设：
 
 ```bash
-SEQ=/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-
-echo "bin:"       $(ls $SEQ/velodyne/*.bin 2>/dev/null | wc -l)
-echo "poses:"     $(wc -l < $SEQ/poses_suma_optim.txt)
-echo "times:"     $(wc -l < $SEQ/times.txt)
-echo "labels:"    $(ls $SEQ/labels/*.label 2>/dev/null | wc -l)
-echo "patchwork:" $(ls $SEQ/patchwork/*.label 2>/dev/null | wc -l)
-echo "hdbscan:"   $(ls $SEQ/hdbscan/*.label 2>/dev/null | wc -l)
+SEQ=/data/sequences/00
+CFG=config/erasor2/seq_00.yaml
+START=0
+END=3450
 ```
 
-正常应全部一致，例如：
+### 1. 配置 YAML
 
-```text
-bin:       2764
-poses:     2764
-times:     2764
-labels:    2764
-patchwork: 2764
-hdbscan:   2764
-```
-
----
-
-## 9. 配置 ERASOR2 的 seq_00.yaml
-
-打开：
-
-```bash
-gedit /home/sb/Eraser_for_dynamic/ERASOR2/config/erasor2/seq_00.yaml
-```
-
-建议先使用下面的基础配置跑通：
+手动运行时必须在 YAML 中填写真实值；与一键脚本不同，C++ 程序不会自动解析
+`end_frame: -1`。
 
 ```yaml
 start_frame: 0
-end_frame: 2763
-viz_interval: 10
-is_large_scale: false
+end_frame: 3450
 
 dataloader:
-    run_traj_clustering: false
-    dataset_name: "SemanticKITTI"
-    abs_data_dir: "/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences"
-    cloud_dir: ""
-    cloud_format: ""
-    pose_path: ""
-    sequence: "00"
-    abs_save_dir: "/home/sb/Eraser_for_dynamic/erasor2_output"
-    instance_seg_method: "hdbscan"
+  dataset_name: "SemanticKITTI"
+  abs_data_dir: "/data/sequences"  # 直接包含 00/、01/ 等 sequence
+  sequence: "00"
+  abs_save_dir: "/data/output"
+  instance_seg_method: "hdbscan"
+  accum_interval: 1
+  voxel_size: 0.1
+  map_voxel_size: 0.1
+  expansion_range: 0
 
-    accum_interval: 2
-    voxel_size: 0.2
-    map_voxel_size: 0.2
+streaming:
+  enabled: true
+  compact_threshold_points: 3000000
+  use_gt_labels: false
 
-    expansion_range: 0
-
-erasor2:
-    grid_resolution: 0.5
-    egocentric_grid_resolution: 0.3
-    range_of_interest: 40.0
-
-    min_z_voi: -1.5
-    max_z_voi: 2.3
-    min_z_diff_thr: 0.3
-    scan_ratio_threshold: 0.2
-
-    log_odds:
-        increment_gain: 2.0
-        increment: 0.15
-
-    region_proposal_thr: 0.8
-    kernel_size: 1
-
-    ratio_num_pts: 0.95
-    minimum_num_pts: 5
-
-    moving_object_detection:
-        negative_log_odds: -2.0
-        obj_score_soft_thr: 4.6
-        obj_score_hard_thr: 14.0
-        hard_thr_radius: 10.0
-
-    over_segmentation:
-        minimum_area_thr: 8
-        ratio_of_unknown_prior: 0.25
-
-    volumetric_outlier_removal:
-        window_size: 1
-        use_adaptive_voxel_size: true
-        vor_cand_score_thr: 4.6
-        dist_thr_gain: 1.732
-
-    viz_flag:
-        set_scan_and_pose: false
-        set_submap: false
-        update: false
-        detect: false
-        over_seg: false
-
-    save_map: true
-
-stop_for_each_frame: false
-
-extrinsic:
-    robot_body_size: 0.8
-    sensor_height: 0.0
-    rotation: [ 1, 0, 0,
-                0, 1, 0,
-                0, 0, 1 ]
-    translation: [ 0.0, 0.0, 0.0 ]
+rerun:
+  enabled: false
+  spawn: false
+  save_path: ""
 ```
 
-注意：
+当 `accum_interval > 1` 时，位姿文件至少要覆盖到
+`end_frame + accum_interval - 1`。处理裁剪后的 sequence 时建议把
+`dataloader.expansion_range` 设为 `0`，避免读取区间外帧。
+
+### 2. 生成 dummy label（仅无语义真值时）
+
+下面的命令仅创建缺失文件，并检查已有 label 的点数，不覆盖真实标签：
+
+```bash
+python3 - "$SEQ" "$START" "$END" <<'PY'
+import sys
+from pathlib import Path
+
+seq = Path(sys.argv[1])
+start, end = int(sys.argv[2]), int(sys.argv[3])
+labels = seq / "labels"
+labels.mkdir(parents=True, exist_ok=True)
+
+for frame in range(start, end + 1):
+    scan = seq / "velodyne" / f"{frame:06d}.bin"
+    label = labels / f"{frame:06d}.label"
+    expected = scan.stat().st_size // 4
+    if label.exists():
+        if label.stat().st_size != expected:
+            raise RuntimeError(f"label 点数不一致: {label}")
+        continue
+    with label.open("wb") as stream:
+        stream.truncate(expected)
+PY
+```
+
+计算依据是每个点在 `.bin` 中占 16 字节，在 `.label` 中占 4 字节，因此 label
+文件大小应等于 bin 文件大小的四分之一。
+
+### 3. 生成地面和实例标签
+
+```bash
+python scripts/kitti_clustering.py \
+  --sequence-dir "$SEQ" \
+  --seq "$(basename "$SEQ")" \
+  --init_stamp "$START" \
+  --end_stamp "$END" \
+  --save-ground-labels \
+  --save-instance-labels
+```
+
+输出写入：
+
+```text
+$SEQ/patchwork/NNNNNN.label
+$SEQ/hdbscan/NNNNNN.label
+```
+
+HDBSCAN 聚类质量会直接影响动态物体去除效果。正式运行前，建议抽查若干帧：
+
+```bash
+python scripts/visualize_clustering.py \
+  --kitti_dir /data \
+  --seq 00 \
+  --init_stamp "$START" \
+  --end_stamp "$END"
+```
+
+上述 `--kitti_dir` 遵循 SemanticKITTI 根目录约定，即点云应位于
+`<kitti_dir>/dataset/sequences/<seq>/velodyne/`。如果数据不采用该布局，可以把
+sequence 临时整理到标准目录后再使用可视化脚本。
+
+### 4. 检查输入数量
+
+```bash
+find "$SEQ/velodyne" -maxdepth 1 -name '*.bin' | wc -l
+wc -l < "$SEQ/poses_suma_optim.txt"
+find "$SEQ/labels"    -maxdepth 1 -name '*.label' | wc -l
+find "$SEQ/patchwork" -maxdepth 1 -name '*.label' | wc -l
+find "$SEQ/hdbscan"   -maxdepth 1 -name '*.label' | wc -l
+```
+
+除文件数量外，每一帧的三个 label 文件都必须与对应点云包含相同点数。
+
+### 5. 生成地图
+
+```bash
+mkdir -p /data/output
+
+./build/mapgen "$CFG"
+./build/run_erasor2 "$CFG"
+```
+
+如果只修改了 ERASOR2 检测阈值且原始累计地图已经存在，可以只重新运行
+`run_erasor2`。如果修改了 frame 范围、体素大小、外参或输入数据，应重新运行
+`mapgen`。
+
+### 6. 评估（仅有真实语义标签时）
+
+```bash
+python scripts/evaluate.py \
+  --gt  /data/output/00_0_to_3450_w_interval_1_voxel_0_1.pcd \
+  --est /data/output/00_0_frame_0_to_3450_streaming_estimated.pcd \
+  --vox 0.1
+```
+
+`evaluate.py` 输出 Preservation、Rejection 和 F1。使用 dummy label 得到的指标没有
+有效语义，不应作为算法性能结论。
+
+## 关键参数
+
+参数示例位于 `config/erasor2/`。常用字段如下：
+
+| 参数 | 说明 |
+|---|---|
+| `start_frame` / `end_frame` | 处理帧范围；`-1` 自动末帧只由一键脚本支持 |
+| `dataloader.accum_interval` | 帧采样间隔 |
+| `dataloader.voxel_size` | `mapgen` 累积过程使用的体素大小 |
+| `dataloader.map_voxel_size` | 最终输出地图的体素大小 |
+| `dataloader.expansion_range` | 轨迹分段后的扩展帧范围；裁剪数据通常设为 `0` |
+| `extrinsic.rotation` / `translation` | 输入 LiDAR 到算法使用坐标系的外参 |
+| `extrinsic.robot_body_size` | 剔除车体附近点的范围 |
+| `erasor2.range_of_interest` | 动态检测关注范围 |
+| `erasor2.min_z_voi` / `max_z_voi` | 输入点云的高度范围 |
+| `erasor2.scan_ratio_threshold` | Scan Ratio 判定阈值；越大通常越激进 |
+| `erasor2.log_odds.*` | 占据更新参数 |
+| `erasor2.region_proposal_thr` | 动态候选区域阈值 |
+| `erasor2.moving_object_detection.*` | 实例动态得分阈值 |
+| `erasor2.volumetric_outlier_removal.*` | 体积离群点过滤与时间窗口参数 |
+| `streaming.enabled` | 开启长序列三遍式 streaming |
+| `streaming.compact_threshold_points` | 全局点数达到该值时执行保标签体素压缩 |
+| `rerun.enabled` | 是否记录 Rerun 可视化数据 |
+
+阈值需要根据传感器线数、点密度、安装高度、场景尺度和实例聚类质量调整。仓库中的
+配置是示例，不应直接视为所有设备的最佳参数。
+
+## Streaming 与普通模式
+
+推荐长 sequence 使用：
 
 ```yaml
-sensor_height: 0.0
+streaming:
+  enabled: true
+  compact_threshold_points: 3000000
+  use_gt_labels: false
 ```
 
-建议先设为 0，用于验证几何建图。如果 `mapgen` 输出和 Python 手动累计一致，再根据实际需要调整。
+Streaming 执行三个 pass：
 
----
+1. 重放扫描并构建可压缩的全局实例地图。
+2. 再次重放扫描，更新全局地面/可通行栅格。
+3. 只加载局部时间窗口执行动态检测，逐帧写出 MOS，并累积静态地图。
 
-## 10. 运行 mapgen 和 run_erasor2
+该模式通过定期体素压缩和窗口化处理降低长序列峰值内存，但通常会增加磁盘读取与
+运行时间。`streaming.enabled: false` 会使用普通内存模式，并生成不带
+`_streaming` 后缀的静态地图。
 
-清空旧输出：
+## 可视化
 
-```bash
-rm -rf /home/sb/Eraser_for_dynamic/erasor2_output
-mkdir -p /home/sb/Eraser_for_dynamic/erasor2_output
+只有使用 `-DERASOR2_ENABLE_RERUN=ON` 编译时，C++ Rerun 输出才会生效。示例：
+
+```yaml
+rerun:
+  enabled: true
+  spawn: true
+  save_path: ""
 ```
 
-运行 mapgen：
+无桌面环境可以写入 `.rrd`：
 
-```bash
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-
-./build/mapgen config/erasor2/seq_00.yaml
+```yaml
+rerun:
+  enabled: true
+  spawn: false
+  save_path: "/data/output/erasor2.rrd"
 ```
 
-运行 ERASOR2：
+批处理时建议保持 `enabled: false`。
 
-```bash
-./build/run_erasor2 config/erasor2/seq_00.yaml
-```
+## 常见问题
 
-输出文件查找：
+### 找不到 `hdbscan/*.label` 或 `patchwork/*.label`
 
-```bash
-find /home/sb/Eraser_for_dynamic/erasor2_output -type f | sort
-find /home/sb/Eraser_for_dynamic/erasor2_output -name "*.pcd" | sort
-```
+预处理没有完成，或 label 点数与点云不一致。重新运行
+`scripts/kitti_clustering.py`，也可以用一键脚本自动检查与生成。
 
----
-## 12. 常见错误与解决
+### 点云与 label 数量不一致
 
-### 12.1 缺 hdbscan label
-
-错误：
+`.bin` 每点是 4 个 `float32`，`.label` 每点是 1 个 `uint32`，所以：
 
 ```text
-Failed to load instance label: .../hdbscan/000000.label
+label 文件字节数 = bin 文件字节数 / 4
 ```
 
-原因：
+不要把其他点格式直接改扩展名为 `.bin`。
 
-```text
-没有运行 kitti_clustering.py，或 hdbscan 目录为空
-```
+### 地图方向错误或墙体重影
 
-解决：
+依次检查：
+
+1. 位姿是否为直接的 `T_map_lidar`，而不是 `T_map_camera` 或 `T_lidar_map`。
+2. 点云与位姿是否严格对应同一帧、同一时间。
+3. 点云是否已正确去畸变。
+4. 多 LiDAR 数据是否已完成时间同步和外参变换。
+5. `extrinsic` 是否与当前点云坐标系一致。
+
+### 手动运行时 `end_frame: -1` 失败
+
+自动末帧属于 `run_sequence.sh` 的功能。直接调用 C++ 程序时必须在 YAML 中填写
+明确的非负 `end_frame`。
+
+### Python 找不到 Open3D、Patchwork++ 或 HDBSCAN
+
+先激活正确环境，或者给一键脚本指定解释器：
 
 ```bash
-python scripts/kitti_clustering.py \
-  --kitti_dir /home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset \
-  --seq 00 \
-  --init_stamp 0 \
-  --end_stamp 2763 \
-  --save-instance-labels \
-  --save-ground-labels
+ERASOR2_PYTHON=/opt/conda/envs/erasor2/bin/python \
+  ./scripts/run_sequence.sh /data/sequences/00 config/erasor2/seq_00.yaml
 ```
 
----
+### 内存不足
 
-### 12.2 缺 SemanticKITTI label
+开启 `streaming.enabled`，适当降低 `compact_threshold_points`，增大
+`map_voxel_size`，或缩小处理帧范围。阈值过低会增加反复体素化的计算成本。
 
-错误：
+## 其他运行入口
 
-```text
-File does not exist: .../labels/000000.label
-```
-
-原因：
-
-```text
-自采数据没有 SemanticKITTI 语义标签
-```
-
-解决：
+已经准备好 YAML 中的所有路径和标签时，可以使用 Python pipeline 串联
+`mapgen → run_erasor2 → evaluate`：
 
 ```bash
-python3 scripts/make_dummy_semantickitti_labels.py \
-  /home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
+python scripts/run_pipeline.py \
+  --config config/erasor2/seq_05.yaml \
+  --conda-env /opt/conda/envs/erasor2
 ```
 
----
+当前 `run_pipeline.py` 按普通模式的 `*_estimated.pcd` 文件名执行评估，因此使用
+该入口时请在对应 YAML 中设置 `streaming.enabled: false`。一键脚本不受此限制。
 
-### 12.3 NumPy 没有 in1d
-
-错误：
-
-```text
-AttributeError: module 'numpy' has no attribute 'in1d'
-```
-
-解决：
+多 sequence 或 ERASOR v1/v2 对比可使用：
 
 ```bash
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-sed -i 's/np\.in1d(/np.isin(/g' scripts/pcd_preprocess.py
+python scripts/run_benchmark.py --algorithm both --build-dir ./build
 ```
 
----
+这些入口面向带真实语义标签的评估数据；一般自采 sequence 优先使用
+`scripts/run_sequence.sh`。
 
-### 12.4 path 和点云互相垂直
-
-原因通常是原版 ERASOR2 把 `poses_suma_optim.txt` 当作 KITTI/SuMa 相机系 pose，又做了相机到雷达转换。
-
-解决：
+## 仓库结构
 
 ```text
-使用 custom pose fix 版 ERASOR2。
-SemanticKITTILoader::loadAllPoses() 必须直接读取 T_map_lidar / T_map_local。
+config/       YAML 参数文件
+include/      C++ 头文件
+src/          mapgen、ERASOR/ERASOR2 和数据加载源码
+scripts/      预处理、评估、一键执行和 benchmark 脚本
+tests/        parity/regression 检查
+docker/       容器辅助文件
+launch/       历史 launch 文件；当前 CMake 构建不使用
+rviz/         历史 RViz 配置；当前推荐使用 Rerun
 ```
 
-日志里应看到类似：
+## 致谢与引用
 
-```text
-Total xxxx poses are loaded as direct T_map_lidar poses
-```
+本仓库基于 [url-kaist/ERASOR2](https://github.com/url-kaist/ERASOR2)，并使用
+PCL、Eigen、OpenCV、Patchwork++、HDBSCAN、nanoflann 和 Rerun 等开源项目。
 
----
-
-### 12.5 地图像时间畸变、墙很厚
-
-优先检查：
-
-```text
-1. bin 和 pose 是否同一帧同一时刻
-2. 点云是否已经去畸变
-3. aux 雷达外参/时间是否准确
-4. 高度裁剪是否过窄
-5. mapgen 输出是否和 Python 手动累计一致
-```
-
-做法：
-
-```text
-先只导出主雷达测试
-再打开 aux 雷达
-最后逐步加高度裁剪
-```
-
-当前 aux-height 版本已经把 aux 和高度裁剪加回，但如果地图明显变厚，应重新对比“主雷达-only”和“主+aux”的结果。
-
----
-
-### 12.6 Rerun Viewer 端口占用
-
-提示：
-
-```text
-A process is already listening at this address
-addr=0.0.0.0:9876
-```
-
-这通常不是致命错误。可以忽略，也可以关闭：
-
-```bash
-pkill rerun
-```
-
----
-
-## 13. 推荐完整流程
-
-```bash
-# 1. Adaptive-LIO 重新导出 ERASOR2 数据
-cd /home/sb/Eraser_for_dynamic/Adaptive-LIO
-rm -rf erasor2_dataset
-colcon build --symlink-install
-source install/setup.bash
-ros2 launch <你的包名> <你的launch文件>.py
-ros2 bag play <你的rosbag路径>
-
-# 2. 生成 dummy labels
-python3 scripts/make_dummy_semantickitti_labels.py \
-  /home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-
-# 3. 生成 patchwork/hdbscan labels
-cd /home/sb/Eraser_for_dynamic/ERASOR2
-source .venv/bin/activate
-sed -i 's/np\.in1d(/np.isin(/g' scripts/pcd_preprocess.py
-
-python scripts/kitti_clustering.py \
-  --kitti_dir /home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset \
-  --seq 00 \
-  --init_stamp 0 \
-  --end_stamp <最后一帧编号> \
-  --save-instance-labels \
-  --save-ground-labels
-
-# 4. 检查数量一致
-SEQ=/home/sb/Eraser_for_dynamic/Adaptive-LIO/erasor2_dataset/dataset/sequences/00
-echo "bin:"       $(ls $SEQ/velodyne/*.bin 2>/dev/null | wc -l)
-echo "poses:"     $(wc -l < $SEQ/poses_suma_optim.txt)
-echo "times:"     $(wc -l < $SEQ/times.txt)
-echo "labels:"    $(ls $SEQ/labels/*.label 2>/dev/null | wc -l)
-echo "patchwork:" $(ls $SEQ/patchwork/*.label 2>/dev/null | wc -l)
-echo "hdbscan:"   $(ls $SEQ/hdbscan/*.label 2>/dev/null | wc -l)
-
-# 5. 跑 ERASOR2
-rm -rf /home/sb/Eraser_for_dynamic/erasor2_output
-mkdir -p /home/sb/Eraser_for_dynamic/erasor2_output
-
-./build/mapgen config/erasor2/seq_00.yaml
-./build/run_erasor2 config/erasor2/seq_00.yaml
-
-# 6. 查看输出
-find /home/sb/Eraser_for_dynamic/erasor2_output -name "*.pcd" | sort
-```
-
----
-
-## 14. 最重要的检查清单
-
-在跑 `run_erasor2` 前，必须满足：
-
-```text
-[ ] velodyne/*.bin 数量正确
-[ ] poses_suma_optim.txt 行数正确
-[ ] times.txt 行数正确
-[ ] labels/*.label 数量正确
-[ ] patchwork/*.label 数量正确
-[ ] hdbscan/*.label 数量正确
-[ ] seq_00.yaml 的 end_frame 等于最后一帧编号
-[ ] ERASOR2 使用 custom pose fix 版本
-[ ] mapgen 输出和 Python 手动累计大体一致
-```
-
-只要这几个条件满足，就可以稳定跑完整 ERASOR2 流程。
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<div align="center">
-    <h1>ERASOR2</h1>
-    <a href="https://github.com/url-kaist/ERASOR2"><img src="https://img.shields.io/badge/-C++-blue?logo=cplusplus" /></a>
-    <a href="https://github.com/url-kaist/ERASOR2"><img src="https://img.shields.io/badge/Python-3670A0?logo=python&logoColor=ffdd54" /></a>
-    <a href="https://github.com/url-kaist/ERASOR2"><img src="https://img.shields.io/badge/Ubuntu-20.04%20%7C%2022.04-E95420?logo=ubuntu&logoColor=white" /></a>
-    <a href="https://github.com/url-kaist/ERASOR2"><img src="https://img.shields.io/badge/CMake-064F8C?logo=cmake&logoColor=white" /></a>
-    <a href="https://www.ipb.uni-bonn.de/wp-content/papercite-data/pdf/lim2023rss.pdf"><img src="https://img.shields.io/badge/Paper-b33737?logo=arXiv" /></a>
-    <a href="https://www.youtube.com/watch?v=cELvWYxfrpY"><img src="https://img.shields.io/badge/YouTube-FF0000?logo=youtube&logoColor=white" /></a>
-    <a href="https://github.com/url-kaist/ERASOR2"><img src="https://img.shields.io/badge/license-GPLv3-green" /></a>
-    <br />
-    <br />
-    <a href="https://www.youtube.com/watch?v=cELvWYxfrpY">Video</a>
-    <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
-    <a href="#package-installation">Install</a>
-    <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
-    <a href="#rocket-how-to-run">How to Run</a>
-    <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
-    <a href="https://www.ipb.uni-bonn.de/wp-content/papercite-data/pdf/lim2023rss.pdf">Paper</a>
-    <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
-    <a href="https://github.com/url-kaist/ERASOR2/issues">Contact Us</a>
-    <br />
-    <br />
-  <p align="center">
-    <img width="640" height="485" alt="ERASOR2 demo" src="https://github.com/user-attachments/assets/5dc13005-c22a-4428-a55e-1f3d6ed97339" />
-    <br />
-    <img width="640" height="294" alt="ERASOR2 comparison" src="https://github.com/user-attachments/assets/3eb35e63-7b71-4bfd-84cd-74605ed34a90" />
-  </p>
-  <p><strong><em>ROS-free, instance-aware static map building</em></strong></p>
-</div>
-
-______________________________________________________________________
-
-## :package: Installation
-
-```bash
-# 1. Build (one cmake call, no ROS/catkin).
-cmake -B build -S . && cmake --build build -j
-
-# 2. Conda env for the Python preprocessors + evaluator.
-conda env create -f scripts/environment.yml   # creates env "erasor2"
-conda activate erasor2
-```
-
-See [**USAGE.md**](USAGE.md) for the full dependency list and per-distro
-notes.
-
-______________________________________________________________________
-
-## SemanticKITTI Setup
-
-Download SemanticKITTI so the sequence folders live under
-`<kitti_dir>/dataset/sequences`. For example, the benchmark tree should
-look like this:
-
-```text
-<kitti_dir>/                         # e.g., /home/<user id>/datasets/kitti
-└── dataset/
-    ├── poses/
-    └── sequences/
-        ├── 00/
-        │   ├── velodyne/
-        │   ├── labels/
-        │   ├── **poses_suma_optim.txt** (important)
-        │   └── times.txt
-        ├── 01/
-        ├── 02/
-        ├── ...
-        └── 10/
-```
-
-ERASOR2 uses SuMa poses for evaluation. Download the pose archive and
-place each `poses_suma_optim.txt` inside its matching sequence directory:
-
-```bash
-wget -O suma_poses_for_erasor_eval.zip "https://www.dropbox.com/scl/fi/9q3b1b9npsst1zjawgou3/suma_poses_for_erasor_eval.zip?rlkey=vx4igm68iuo3eobpolgq4tblg&st=yt1ola9b&dl=0"
-# unzip, then copy each file to:
-# <kitti_dir>/dataset/sequences/<seq>/poses_suma_optim.txt
-```
-
-For each benchmark config in `config/erasor2/seq_{00,01,02,05,07}.yaml`,
-set `dataloader.abs_data_dir` to `<kitti_dir>/dataset/sequences` and
-`dataloader.abs_save_dir` to your ERASOR2 output directory.
-
-______________________________________________________________________
-
-## :rocket: How to Run
-
-```bash
-# 3. Generate per-frame Patchwork ground + HDBSCAN instance labels
-#    for seqs 00, 01, 02, 05, 07 in one shot.
-scripts/generate_labels.sh /path/to/kitti
-
-# 4. Edit config/erasor2/seq_{00,01,02,05,07}.yaml to point at your
-#    kitti and output directories, then run the full benchmark.
-python scripts/run_benchmark.py
-```
-
-`scripts/run_benchmark.py` invokes `run_pipeline.py` for each yaml
-(mapgen &rarr; run_erasor2 &rarr; evaluate.py), then prints a single
-consolidated PR / RR / F1 table. See [**USAGE.md**](USAGE.md) for further
-explanation &mdash; per-step breakdown, path-editing conventions,
-visualizer, YAML reference, and HeLiPR / HeLiMOS setup.
-
-______________________________________________________________________
-
-## :bar_chart: Headline numbers
-
-Some reproduced numbers may differ slightly from the paper after the
-ROS-free refactor, but the overall performance remains consistent with
-the reported HDBSCAN-based results. Because this implementation uses
-HDBSCAN for instance segmentation, compare against the HDBSCAN rows in
-Table III of the paper.
-
-<div align="center">
-
-| Seq | Frames | PR [%] ( $\color{#c026d3}\textsf{paper}$ / $\color{#0969da}\textsf{ours}$ ) | RR [%] ( $\color{#c026d3}\textsf{paper}$ / $\color{#0969da}\textsf{ours}$ ) | F1 ( $\color{#c026d3}\textsf{paper}$ / $\color{#0969da}\textsf{ours}$ ) |
-|:---:|:---:|:---:|:---:|:---:|
-| 00 | 4390 – 4530 | $\color{#c026d3}98.649$ / $\color{#0969da}\mathbf{98.654}$ | $\color{#c026d3}\mathbf{98.582}$ / $\color{#0969da}98.454$ | $\color{#c026d3}\mathbf{0.986}$ / $\color{#0969da}0.9855$ |
-| 01 |  150 –  250 | $\color{#c026d3}93.554$ / $\color{#0969da}\mathbf{95.743}$ | $\color{#c026d3}\mathbf{94.951}$ / $\color{#0969da}94.027$ | $\color{#c026d3}0.943$ / $\color{#0969da}\mathbf{0.9488}$ |
-| 02 |  860 –  950 | $\color{#c026d3}98.339$ / $\color{#0969da}\mathbf{99.196}$ | $\color{#c026d3}99.709$ / $\color{#0969da}\mathbf{99.902}$ | $\color{#c026d3}0.990$ / $\color{#0969da}\mathbf{0.9955}$ |
-| 05 | 2350 – 2670 | $\color{#c026d3}97.473$ / $\color{#0969da}\mathbf{97.670}$ | $\color{#c026d3}\mathbf{99.113}$ / $\color{#0969da}98.412$ | $\color{#c026d3}\mathbf{0.983}$ / $\color{#0969da}0.9804$ |
-| 07 |  630 –  820 | $\color{#c026d3}\mathbf{98.767}$ / $\color{#0969da}96.135$ | $\color{#c026d3}98.800$ / $\color{#0969da}\mathbf{98.989}$ | $\color{#c026d3}\mathbf{0.988}$ / $\color{#0969da}0.9754$ |
-
-</div>
-
-<sub>$\color{#c026d3}\textsf{Magenta}$ = paper (Table III, HDBSCAN row), $\color{#0969da}\textsf{blue}$ = our re-run. **Bold** marks the higher value per cell.</sub>
-
-ERASOR2 reproduces within run-to-run noise (mean |&Delta;F1| = 0.006).
-Higher is better on all three metrics:
-
-- **PR (Preservation Rate)** measures how much true
-  static structure remains after dynamic-object removal.
-- **RR (Rejection Rate)** measures how much dynamic
-  structure is correctly rejected from the static map.
-- **F1** is the harmonic mean of PR and RR, giving one balanced score
-  when preservation and rejection both matter.
-
-______________________________________________________________________
-
-## :books: Citation
-
-If you use this code in academic work, please cite the ERASOR / ERASOR2
-papers.
+如在学术工作中使用，请引用 ERASOR2 和 ERASOR：
 
 ```bibtex
 @article{lim2025erasor2,
@@ -884,9 +531,7 @@ papers.
   journal = {IEEE Robotics and Automation Letters},
   year    = {2025}
 }
-```
 
-```bibtex
 @article{lim2021erasor,
   title   = {{ERASOR}: Egocentric Ratio of Pseudo Occupancy-based Dynamic Object Removal for Static 3D Point Cloud Map Building},
   author  = {Lim, Hyungtae and Hwang, Sungwon and Myung, Hyun},
@@ -898,12 +543,4 @@ papers.
 }
 ```
 
-```bibtex
-@inproceedings{lim2024helimos,
-  title     = {{HeLiMOS: A dataset for moving object segmentation in 3D point clouds from heterogeneous LiDAR sensors}},
-  author    = {Lim, Hyungtae and Jang, Seoyeon and Mersch, Benedikt and Behley, Jens and Myung, Hyun and Stachniss, Cyrill},
-  booktitle = {2024 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
-  pages     = {14087--14094},
-  year      = {2024}
-}
-```
+许可证见 [Licence](Licence)。

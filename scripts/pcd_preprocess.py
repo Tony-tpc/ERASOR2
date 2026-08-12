@@ -25,7 +25,7 @@ def clusters_hdbscan(points_set):
     cluster_info = cluster_info[cluster_info[:, 1].argsort()]
     # cluster_info_tmp = cluster_info[::-1]  # noqa: F841
     clusters_labels = cluster_info[::-1][:, 0]
-    labels[np.in1d(labels, clusters_labels, invert=True)] = -1
+    labels[np.isin(labels, clusters_labels, invert=True)] = -1
     # print("Checking: ", np.unique(labels))
     return labels
 
@@ -39,7 +39,7 @@ def clusters_from_pcd(pcd):
     cluster_info = cluster_info[cluster_info[:, 1].argsort()]
 
     clusters_labels = cluster_info[::-1][:, 0]
-    labels[np.in1d(labels, clusters_labels, invert=True)] = -1
+    labels[np.isin(labels, clusters_labels, invert=True)] = -1
 
     return labels
 
