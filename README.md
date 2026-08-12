@@ -1,4 +1,4 @@
-# ERASOR2：动态物体去除与静态点云地图生成
+# ERASOR2：免ROS/ROS2的动态物体去除与静态点云地图生成
 
 本仓库在 [url-kaist/ERASOR2](https://github.com/url-kaist/ERASOR2) 的算法基础上，
 提供了一套面向离线 LiDAR sequence 的完整处理流程。输入逐帧点云、LiDAR 位姿和
@@ -19,9 +19,6 @@ MOS 标签。
 ```
 
 ## 相比 url-kaist 原版的主要改进
-
-本分支的优势主要是工程化、数据接入和长序列运行能力。ERASOR2 的核心思想仍来自
-原论文；下列改进不代表在所有数据集上必然获得更高的 PR、RR 或 F1。
 
 | 项目 | url-kaist 原版 | 当前版本 |
 |---|---|---|
@@ -64,7 +61,17 @@ conda activate erasor2
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip setuptools wheel
-python -m pip install -r scripts/requirements.txt PyYAML
+pip install \
+  "numpy>=1.18.0" \
+  "matplotlib>=3.3.0" \
+  "scikit-learn>=0.24.0" \
+  "hdbscan>=0.8.28" \
+  "tqdm>=4.62.0" \
+  "tabulate>=0.8.9" \
+  "PyYAML" \
+  "open3d>=0.15.0" \
+  "pypatchworkpp>=1.3.1" \
+  "rerun-sdk>=0.21"
 ```
 
 ### 编译
@@ -97,7 +104,7 @@ cmake --build build -j"$(nproc)"
 
 ### Sequence 目录结构
 
-推荐使用 SemanticKITTI 风格目录。一个 sequence 应类似：
+推荐使用 SemanticKITTI 风格目录（由里程计得到）。一个 sequence 应类似：
 
 ```text
 /data/sequences/00/
@@ -491,9 +498,6 @@ python scripts/run_pipeline.py \
   --config config/erasor2/seq_05.yaml \
   --conda-env /opt/conda/envs/erasor2
 ```
-
-当前 `run_pipeline.py` 按普通模式的 `*_estimated.pcd` 文件名执行评估，因此使用
-该入口时请在对应 YAML 中设置 `streaming.enabled: false`。一键脚本不受此限制。
 
 多 sequence 或 ERASOR v1/v2 对比可使用：
 
