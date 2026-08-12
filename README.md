@@ -18,6 +18,10 @@ MOS 标签。
                     └── 逐帧 MOS 标签
 ```
 
+| 原始图像 | `ERASOR2` 处理后 |
+|:------:|:-----:|
+| ![](resources/before.png) | ![](resources/after.png) |
+
 ## 相比 url-kaist 原版的主要改进
 
 | 项目 | url-kaist 原版 | 当前版本 |
@@ -26,10 +30,9 @@ MOS 标签。
 | Grid Map | 依赖 ROS 生态中的 `grid_map` 包 | 内置算法实际需要的轻量 Grid Map 实现，减少系统依赖 |
 | 自采 sequence 接入 | 通常需要手工整理路径、标签并逐项启动 | `run_sequence.sh` 只接收 sequence 路径和参数文件，自动完成检查、预处理与执行 |
 | 位姿输入 | SemanticKITTI/SuMa 相机位姿转换流程 | 直接读取 `T_map_lidar`，支持 KITTI 3×4 和时间戳加四元数两种格式，更适合直接输出 LiDAR 位姿的系统 |
-| 长序列内存 | 主要以内存中的完整序列和地图运行 | 提供三遍式 external-memory streaming，按阈值压缩全局地图，并仅保留时间窗口 |
+| 长序列内存 | 主要以内存中的完整序列和地图运行 | 提供三遍式 external-memory streaming，按阈值压缩全局地图，并仅保留时间窗口，极大降低内存占用的同时保证处理效果 |
 | 可视化 | RViz、TF 和 ROS publisher | Rerun 可选；默认可完全关闭，适合无桌面的服务器和批处理 |
-| 输出与复现 | 主要面向论文数据集流程 | 同时输出静态地图和逐帧 MOS 标签；提供 pipeline、benchmark 和 parity 检查工具 |
-| ERASOR 版本 | ERASOR2 | 同一次 CMake 构建还可生成 ERASOR v1 的 `run_erasor`，便于横向比较 |
+
 
 当前版本把位姿文件解释为直接的 `T_map_lidar`。如果已有的是相机位姿或其他传感器
 坐标系位姿，必须先用外参转换到 LiDAR 位姿；否则轨迹方向和点云地图可能不一致。
@@ -487,26 +490,6 @@ ERASOR2_PYTHON=/opt/conda/envs/erasor2/bin/python \
 
 开启 `streaming.enabled`，适当降低 `compact_threshold_points`，增大
 `map_voxel_size`，或缩小处理帧范围。阈值过低会增加反复体素化的计算成本。
-
-## 其他运行入口
-
-已经准备好 YAML 中的所有路径和标签时，可以使用 Python pipeline 串联
-`mapgen → run_erasor2 → evaluate`：
-
-```bash
-python scripts/run_pipeline.py \
-  --config config/erasor2/seq_05.yaml \
-  --conda-env /opt/conda/envs/erasor2
-```
-
-多 sequence 或 ERASOR v1/v2 对比可使用：
-
-```bash
-python scripts/run_benchmark.py --algorithm both --build-dir ./build
-```
-
-这些入口面向带真实语义标签的评估数据；一般自采 sequence 优先使用
-`scripts/run_sequence.sh`。
 
 ## 仓库结构
 
